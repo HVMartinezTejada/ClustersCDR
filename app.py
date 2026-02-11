@@ -3,21 +3,16 @@ import pandas as pd
 import numpy as np
 import requests
 import plotly.express as px
-import plotly.graph_objects as go
 
 from pulp import (
-    LpProblem, LpMinimize, LpVariable, lpSum, LpBinary,
-    LpStatus, value, PULP_CBC_CMD
+    LpProblem, LpMinimize, LpVariable, lpSum,
+    LpBinary, LpStatus, value
 )
 
 # =========================
 # Config
 # =========================
-st.set_page_config(
-    page_title="CDR Oriente Antioqueño – Optimizador Territorial (V2)",
-    layout="wide"
-)
-
+st.set_page_config(page_title="CDR Oriente Antioqueño – Optimizador Territorial", layout="wide")
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving/"
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
@@ -26,18 +21,21 @@ DEFAULT_MUNICIPIOS = [
     "Abejorral", "Guarne", "Marinilla", "El Santuario", "El Peñol"
 ]
 
-# Preset RSU (t/año) – el de tu imagen
-PRESET_RSU = {
-    "La Ceja": 22300,
-    "La Unión": 6534,
-    "El Retiro": 7178,
-    "Rionegro": 63344,
-    "El Carmen de Viboral": 9000,
-    "Abejorral": 6080,
-    "Guarne": 16914,
-    "Marinilla": 19790,
-    "El Santuario": 10793,
-    "El Peñol": 6311,
+# -------------------------
+# Preset RSU (t/año)
+# Ajusta estos valores con tus cifras base (PGIRS / línea base).
+# -------------------------
+DEFAULT_RSU_PRESET = {
+    "La Ceja": 30000.0,
+    "La Unión": 8000.0,
+    "El Retiro": 12000.0,
+    "Rionegro": 60000.0,
+    "El Carmen de Viboral": 18000.0,
+    "Abejorral": 6000.0,
+    "Guarne": 16000.0,
+    "Marinilla": 14000.0,
+    "El Santuario": 9000.0,
+    "El Peñol": 5000.0,
 }
 
 # =========================
@@ -48,7 +46,7 @@ def geocode_municipio(nombre: str):
     """Geocodifica municipio usando Nominatim (OSM). Retorna (lat, lon)."""
     q = f"{nombre}, Antioquia, Colombia"
     params = {"q": q, "format": "json", "limit": 1}
-    headers = {"User-Agent": "cdroptimizer-streamlit/2.0 (contact: hv)"}
+    headers = {"User-Agent": "cdroptimizer-streamlit/1.0 (contact: user)"}
     r = requests.get(NOMINATIM_URL, params=params, headers=headers, timeout=30)
     r.raise_for_status()
     data = r.json()
@@ -68,7 +66,7 @@ def build_distance_matrix_osrm(coords_dict: dict):
     coord_str = ";".join([f"{coords_dict[n][1]},{coords_dict[n][0]}" for n in names])  # lon,lat
     url = OSRM_TABLE_URL + coord_str
     params = {"annotations": "distance"}  # metros
-    r = requests.get(url, params=params, timeout=90)
+    r = requests.get(url, params=params, timeout=60)
     r.raise_for_status()
     js = r.json()
     dist_m = np.array(js["distances"], dtype=float)
@@ -88,7 +86,7 @@ def candidate_ranking_single_plant(dfD: pd.DataFrame, w: pd.Series):
     return df_rank.reset_index()
 
 # =========================
-# V2 Solver (capacitado + equidad + “utilización” vía max unused capacity)
+# Solver V2 (capacidad + gamma + unmet)
 # =========================
 def solve_facility_location_v2(
     dfD: pd.DataFrame,
@@ -96,20 +94,34 @@ def solve_facility_location_v2(
     k: int,
     alpha: float,
     gamma: float,
-    cap_t_anio: float,
+    cap_per_plant_t_anio: float,
+    allow_unmet: bool,
+    penalty_unmet: float,
 ):
     """
-    Modelo V2:
-      min  alpha * sum_i sum_j w_i * d_ij * x_ij
-         + (1-alpha) * z
-         + gamma * u
-    s.a.
-      - asignación: sum_j x_ij = 1
-      - link: x_ij <= y_j
-      - exactamente k plantas: sum_j y_j = k
-      - capacidad por planta: sum_i w_i x_ij <= cap * y_j
-      - equidad: z >= d_ij * x_ij
-      - utilización proxy: u >= cap*y_j - load_j  (max capacidad no usada)
+    Objetivo:
+      alpha * sum_i sum_j served_i * d_ij * x_ij
+    + (1-alpha) * z
+    + gamma * u
+    + (allow_unmet) penalty_unmet * unmet
+
+    Donde:
+      served_i <= w_i
+      sum_j x_ij == 1
+      x_ij <= y_j
+      sum_j y_j == k
+
+      Capacidad por planta:
+        sum_i served_i * x_ij <= cap * y_j
+
+      Equidad:
+        z >= d_ij * x_ij  (max-dist)
+
+      Subutilización:
+        u >= cap*y_j - load_j  para todo j
+        load_j = sum_i served_i * x_ij
+
+      unmet = sum_i (w_i - served_i)
     """
     I = list(dfD.index)
     J = list(dfD.columns)
@@ -119,181 +131,160 @@ def solve_facility_location_v2(
         raise ValueError("Hay RSU negativos. Corrige entradas.")
     if w.sum() <= 0:
         raise ValueError("La suma total de RSU debe ser > 0 para optimizar.")
-    if cap_t_anio <= 0:
-        raise ValueError("La capacidad anual por planta debe ser > 0.")
-    if w.sum() > cap_t_anio * k:
-        raise ValueError(
-            f"Demanda total RSU ({w.sum():,.0f} t/año) excede capacidad total ({cap_t_anio*k:,.0f} t/año). "
-            "Aumenta k o la capacidad por planta."
-        )
+
+    k = int(k)
+    if k < 1 or k > len(J):
+        raise ValueError("k fuera de rango.")
+
+    if cap_per_plant_t_anio <= 0:
+        raise ValueError("La capacidad por planta (t/año) debe ser > 0.")
 
     prob = LpProblem("CDR_Oriente_Antioquia_V2", LpMinimize)
 
     x = LpVariable.dicts("x", (I, J), lowBound=0, upBound=1, cat=LpBinary)
     y = LpVariable.dicts("y", J, lowBound=0, upBound=1, cat=LpBinary)
-    z = LpVariable("z_maxdist", lowBound=0)
-    u = LpVariable("u_max_unused_capacity", lowBound=0)
 
-    # Load per facility (linear expression)
-    load = {j: lpSum(w[i] * x[i][j] for i in I) for j in J}
+    served = LpVariable.dicts("served", I, lowBound=0)  # t/año servidas por municipio
+    z = LpVariable("z_maxdist", lowBound=0)             # km
+    u = LpVariable("u_max_unused_capacity", lowBound=0) # t/año (capacidad no usada máxima)
 
-    # Objective
-    prob += (
-        alpha * lpSum(w[i] * dfD.loc[i, j] * x[i][j] for i in I for j in J)
-        + (1 - alpha) * z
-        + gamma * u
-    )
+    # Variables auxiliares
+    load = LpVariable.dicts("load", J, lowBound=0)      # t/año atendidas por planta
 
-    # Assignment
+    # Definir served bounds
+    for i in I:
+        prob += served[i] <= float(w[i]), f"served_leq_w_{i}"
+
+    # Asignación + apertura
     for i in I:
         prob += lpSum(x[i][j] for j in J) == 1, f"assign_{i}"
-
-    # Open link
     for i in I:
         for j in J:
             prob += x[i][j] <= y[j], f"open_link_{i}_{j}"
 
-    # Exactly k
-    prob += lpSum(y[j] for j in J) == int(k), "k_facilities"
+    prob += lpSum(y[j] for j in J) == k, "k_facilities"
 
-    # Capacity
+    # Cargar por planta: load_j = sum_i served_i * x_ij
+    # OJO: served_i * x_ij es bilineal en teoría, pero aquí served_i es continuo y x_ij binario,
+    # PuLP no soporta bilineal directamente. Solución práctica: linearizar con "served_ij".
+    served_ij = LpVariable.dicts("served_ij", (I, J), lowBound=0)
+
+    for i in I:
+        for j in J:
+            # served_ij <= served_i
+            prob += served_ij[i][j] <= served[i], f"servedij_le_served_{i}_{j}"
+            # served_ij <= w_i * x_ij
+            prob += served_ij[i][j] <= float(w[i]) * x[i][j], f"servedij_le_wx_{i}_{j}"
+            # served_ij >= served_i - w_i*(1-x_ij)
+            prob += served_ij[i][j] >= served[i] - float(w[i]) * (1 - x[i][j]), f"servedij_ge_served_minus_{i}_{j}"
+
     for j in J:
-        prob += load[j] <= cap_t_anio * y[j], f"cap_{j}"
+        prob += load[j] == lpSum(served_ij[i][j] for i in I), f"load_def_{j}"
+        # Capacidad
+        prob += load[j] <= cap_per_plant_t_anio * y[j], f"cap_{j}"
+        # Subutilización (capacidad no usada)
+        prob += u >= cap_per_plant_t_anio * y[j] - load[j], f"unused_{j}"
 
-    # Equity
+    # Equidad (max distance)
     for i in I:
         for j in J:
             prob += z >= dfD.loc[i, j] * x[i][j], f"maxdist_{i}_{j}"
 
-    # Utilization proxy: maximize worst utilization <=> minimize worst unused
-    for j in J:
-        prob += u >= cap_t_anio * y[j] - load[j], f"max_unused_{j}"
+    # Unmet
+    unmet = lpSum(float(w[i]) - served[i] for i in I)
 
-    # Solve (CBC)
-    prob.solve(PULP_CBC_CMD(msg=False))
+    # Objetivo principal: costo logístico ponderado (t·km/año) usando served_ij
+    cost_wdist = lpSum(dfD.loc[i, j] * served_ij[i][j] for i in I for j in J)
 
+    obj = alpha * cost_wdist + (1 - alpha) * z + gamma * u
+    if allow_unmet:
+        obj += penalty_unmet * unmet
+    else:
+        # Si no permites unmet, fuerza served_i = w_i (es decir, servir todo)
+        for i in I:
+            prob += served[i] == float(w[i]), f"force_full_service_{i}"
+
+    prob += obj
+
+    # Solve
+    prob.solve()
     status = LpStatus.get(prob.status, str(prob.status))
 
+    # Extract opened + assignment
     opened = [j for j in J if value(y[j]) > 0.5]
 
     assign = []
     for i in I:
+        chosen_j = None
         for j in J:
             if value(x[i][j]) > 0.5:
-                assign.append((i, j, float(dfD.loc[i, j]), float(w[i])))
+                chosen_j = j
                 break
+        if chosen_j is None:
+            chosen_j = J[0]
+        dist_km = float(dfD.loc[i, chosen_j])
+        rsu_i = float(w[i])
+        served_i = float(value(served[i]))
+        assign.append((i, chosen_j, dist_km, rsu_i, served_i))
 
-    df_assign = pd.DataFrame(assign, columns=["municipio", "planta_asignada", "dist_km", "rsu_t_anio"])
-    df_assign["costo_wdist"] = df_assign["rsu_t_anio"] * df_assign["dist_km"]
+    df_assign = pd.DataFrame(assign, columns=["municipio", "planta_asignada", "dist_km", "rsu_t_anio", "served_t_anio"])
+    df_assign["costo_wdist"] = df_assign["served_t_anio"] * df_assign["dist_km"]
 
-    # Loads per plant (for utilization)
-    loads = df_assign.groupby("planta_asignada")["rsu_t_anio"].sum().reindex(opened).fillna(0.0)
-    df_plants = pd.DataFrame({
-        "planta": loads.index,
-        "carga_t_anio": loads.values,
-    })
-    df_plants["cap_t_anio"] = cap_t_anio
-    df_plants["utilizacion_%"] = np.where(
-        df_plants["cap_t_anio"] > 0,
-        100 * df_plants["carga_t_anio"] / df_plants["cap_t_anio"],
-        0.0
-    )
-    df_plants["cap_no_usada_t_anio"] = df_plants["cap_t_anio"] - df_plants["carga_t_anio"]
-    df_plants["cap_no_usada_t_anio"] = df_plants["cap_no_usada_t_anio"].clip(lower=0)
-
+    # KPIs
     total_w = df_assign["rsu_t_anio"].sum()
-    wavg_dist = (df_assign["rsu_t_anio"] * df_assign["dist_km"]).sum() / total_w
-    max_dist = df_assign["dist_km"].max()
+    total_served = df_assign["served_t_anio"].sum()
+    unmet_t = total_w - total_served
+
+    # promedio ponderado por lo servido (más coherente cuando hay unmet)
+    if total_served > 0:
+        wavg_dist = (df_assign["served_t_anio"] * df_assign["dist_km"]).sum() / total_served
+    else:
+        wavg_dist = np.nan
+
+    max_dist = df_assign["dist_km"].max() if len(df_assign) else np.nan
     total_cost = df_assign["costo_wdist"].sum()
+
+    # Utilización por planta
+    plant_load = df_assign.groupby("planta_asignada")["served_t_anio"].sum().reindex(opened).fillna(0.0)
+    plant_util = (plant_load / cap_per_plant_t_anio * 100.0).replace([np.inf, -np.inf], np.nan)
+
+    util_avg = float(np.nanmean(plant_util.values)) if len(plant_util) else np.nan
+    util_min = float(np.nanmin(plant_util.values)) if len(plant_util) else np.nan
+    util_max = float(np.nanmax(plant_util.values)) if len(plant_util) else np.nan
+
+    df_plants = pd.DataFrame({
+        "planta": list(plant_load.index),
+        "carga_t_anio": plant_load.values,
+        "capacidad_t_anio": cap_per_plant_t_anio,
+        "utilizacion_%": plant_util.values
+    }).sort_values("utilizacion_%", ascending=False)
 
     return {
         "status": status,
         "opened": opened,
-        "objective": value(prob.objective),
+        "objective": float(value(prob.objective)) if prob.objective is not None else np.nan,
         "total_cost_wdist": float(total_cost),
-        "wavg_dist_km": float(wavg_dist),
-        "max_dist_km": float(max_dist),
-        "z_maxdist_km": float(value(z)),
-        "u_max_unused_t_anio": float(value(u)),
+        "wavg_dist_km": float(wavg_dist) if wavg_dist == wavg_dist else np.nan,
+        "max_dist_km": float(max_dist) if max_dist == max_dist else np.nan,
+        "z_maxdist_km": float(value(z)) if z is not None else np.nan,
+        "u_max_unused_cap_t_anio": float(value(u)) if u is not None else np.nan,
+        "unmet_t_anio": float(unmet_t),
+        "served_total_t_anio": float(total_served),
+        "demand_total_t_anio": float(total_w),
+        "util_avg_%": util_avg,
+        "util_min_%": util_min,
+        "util_max_%": util_max,
         "df_assign": df_assign,
-        "df_plants": df_plants
+        "df_plants": df_plants,
     }
-
-# =========================
-# Viz: radial “cluster plot”
-# =========================
-def radial_cluster_plot(df_assign: pd.DataFrame, opened: list):
-    """
-    Diagrama radial:
-      - Cada planta: centro (r=0)
-      - Municipios asignados: r = dist_km, ángulo distribuido
-    """
-    if df_assign.empty or not opened:
-        return None
-
-    fig = go.Figure()
-    for plant in opened:
-        sub = df_assign[df_assign["planta_asignada"] == plant].copy()
-        sub = sub.sort_values("dist_km", ascending=True)
-
-        # Planta como “centro”
-        fig.add_trace(go.Scatterpolar(
-            r=[0],
-            theta=[0],
-            mode="markers+text",
-            text=[f"PLANTA: {plant}"],
-            textposition="top center",
-            name=f"Planta {plant}"
-        ))
-
-        # Municipios alrededor: ángulos equiespaciados
-        n = len(sub)
-        if n == 0:
-            continue
-        thetas = np.linspace(10, 350, n)  # evita 0 para no chocar
-        fig.add_trace(go.Scatterpolar(
-            r=sub["dist_km"].values,
-            theta=thetas,
-            mode="markers+text",
-            text=[f"{m} ({d:.1f} km)" for m, d in zip(sub["municipio"], sub["dist_km"])],
-            textposition="top center",
-            name=f"Aportantes → {plant}"
-        ))
-
-    fig.update_layout(
-        title="Clúster radial (distancia vial a planta asignada)",
-        showlegend=True,
-        polar=dict(
-            radialaxis=dict(visible=True, title="Distancia (km)")
-        ),
-        margin=dict(l=20, r=20, t=60, b=20),
-        height=520
-    )
-    return fig
-
-# =========================
-# State: preset restore
-# =========================
-def make_preset_df(municipios: list):
-    rows = []
-    for m in municipios:
-        rows.append({
-            "municipio": m,
-            "rsu_t_anio": float(PRESET_RSU.get(m, 0.0))
-        })
-    return pd.DataFrame(rows)
-
-if "rsu_df" not in st.session_state:
-    st.session_state.rsu_df = make_preset_df(DEFAULT_MUNICIPIOS)
 
 # =========================
 # UI
 # =========================
-st.title("📍 Optimizador Territorial CDR – Oriente Antioqueño (V2)")
-st.caption(
-    "V2 = distancias viales reales (OSRM) + optimización (costo logístico + equidad + capacidad/utilización)."
-)
+st.title("📍 Optimizador Territorial CDR – Oriente Antioqueño (distancias viales reales)")
+st.caption("Calcula matriz vial (km) y ubica 1 o k plantas minimizando costo logístico, equidad territorial y (V2) subutilización/capacidad.")
 
+# Sidebar
 with st.sidebar:
     st.header("1) Municipios del clúster")
     municipios = st.multiselect(
@@ -302,178 +293,267 @@ with st.sidebar:
         default=DEFAULT_MUNICIPIOS
     )
 
-    c_restore, _ = st.columns([1, 1])
-    with c_restore:
-        if st.button("🔄 Restaurar preset", use_container_width=True):
-            st.session_state.rsu_df = make_preset_df(DEFAULT_MUNICIPIOS)
-
+    # Preset + restore
     st.header("2) RSU (t/año) – Preset editable")
-    st.caption("Puedes editar manualmente o subir un CSV con columnas: municipio, rsu_t_anio")
+    if "df_rsu_state" not in st.session_state:
+        # Inicializa con preset (solo municipios seleccionados)
+        init = []
+        for m in DEFAULT_MUNICIPIOS:
+            init.append([m, float(DEFAULT_RSU_PRESET.get(m, 0.0))])
+        st.session_state.df_rsu_state = pd.DataFrame(init, columns=["municipio", "rsu_t_anio"])
 
-    uploaded = st.file_uploader("Subir CSV RSU", type=["csv"])
+    colA, colB = st.columns(2)
+    with colA:
+        restore = st.button("↩️ Restaurar preset", use_container_width=True)
+    with colB:
+        st.write("")  # spacer
 
+    if restore:
+        init = []
+        for m in DEFAULT_MUNICIPIOS:
+            init.append([m, float(DEFAULT_RSU_PRESET.get(m, 0.0))])
+        st.session_state.df_rsu_state = pd.DataFrame(init, columns=["municipio", "rsu_t_anio"])
+
+    uploaded = st.file_uploader("Subir CSV RSU (opcional)", type=["csv"])
     if uploaded is not None:
         df_rsu_up = pd.read_csv(uploaded)
         df_rsu_up.columns = [c.strip().lower() for c in df_rsu_up.columns]
         if not {"municipio", "rsu_t_anio"}.issubset(set(df_rsu_up.columns)):
             st.error("El CSV debe tener columnas: municipio, rsu_t_anio")
         else:
-            # merge con preset actual para mantener municipios
-            st.session_state.rsu_df = df_rsu_up[["municipio", "rsu_t_anio"]].copy()
+            st.session_state.df_rsu_state = df_rsu_up.rename(columns={"rsu_t_anio": "rsu_t_anio"}).copy()
 
-    # Base df para editor
-    base_df = st.session_state.rsu_df.copy()
+    df_rsu = st.session_state.df_rsu_state.copy()
+    df_rsu = df_rsu[df_rsu["municipio"].isin(municipios)].copy()
+    df_rsu = df_rsu.drop_duplicates(subset=["municipio"], keep="last")
+    df_rsu = df_rsu.set_index("municipio").reindex(municipios).fillna(0.0).reset_index()
 
-    # Asegurar que estén SOLO los municipios seleccionados (pero conservando valores)
-    base_df = base_df.drop_duplicates(subset=["municipio"], keep="last")
-    base_df = base_df[base_df["municipio"].isin(municipios)].copy()
+    st.write("Editar RSU aquí (t/año):")
+    df_rsu = st.data_editor(df_rsu, use_container_width=True, num_rows="fixed")
 
-    # si agregaron municipios nuevos y no existen en df, los añadimos con preset (o cero)
-    missing = [m for m in municipios if m not in set(base_df["municipio"])]
-    if missing:
-        base_df = pd.concat([base_df, make_preset_df(missing)], ignore_index=True)
+    # Persistir cambios
+    # (guardamos solo lo visible; para simplicidad)
+    st.session_state.df_rsu_state = pd.concat([
+        st.session_state.df_rsu_state[~st.session_state.df_rsu_state["municipio"].isin(municipios)],
+        df_rsu
+    ], ignore_index=True)
 
-    base_df = base_df.set_index("municipio").reindex(municipios).fillna(0.0).reset_index()
-
-    st.write("Editar RSU aquí:")
-    df_rsu = st.data_editor(
-        base_df,
-        use_container_width=True,
-        num_rows="fixed"
-    )
-
-    # Persistir cambios (solo a municipios seleccionados)
-    st.session_state.rsu_df = df_rsu.copy()
-
-    st.header("3) Capacidad por planta")
-    st.caption("Restricción operativa: cada planta tiene un máximo anual.")
-    cap_t_h = st.number_input("Capacidad (t/h) por planta", min_value=0.1, value=12.0, step=0.5)
-    horas_anio = st.number_input("Horas operativas por año (h/año)", min_value=1, value=6000, step=250)
-    cap_t_anio = float(cap_t_h) * float(horas_anio)
-
-    st.info(f"Capacidad anual por planta ≈ **{cap_t_anio:,.0f} t/año**")
-
-    st.header("4) Optimización")
+    st.header("3) Parámetros del modelo")
     k = st.slider("Número de plantas (k)", min_value=1, max_value=max(1, len(municipios)), value=1)
 
-    alpha = st.slider("α (mezcla costo vs equidad)", 0.0, 1.0, 0.75, 0.05)
-    st.caption(f"Interpretación: **{alpha*100:.0f}% costo / {(1-alpha)*100:.0f}% equidad**")
+    alpha = st.slider("Peso costo logístico (α)", 0.0, 1.0, 0.75, 0.05)
+    st.caption(f"Interpretación: **{int(alpha*100)}% costo** / **{int((1-alpha)*100)}% equidad**")
 
-    gamma = st.slider("γ (penaliza subutilización)", 0.0, 5.0, 0.50, 0.05)
-    st.caption("γ alto empuja a que la(s) planta(s) abierta(s) no queden “vacías” (mejor uso de capacidad).")
+    gamma = st.slider("Peso anti-subutilización (γ)", 0.0, 3.0, 0.5, 0.1)
+    st.caption("γ alto penaliza plantas poco cargadas (prefiere menos plantas o asignación más concentrada).")
 
-    run = st.button("🚀 Calcular distancias + Optimizar (V2)", type="primary", use_container_width=True)
+    st.header("4) Capacidad por planta")
+    cap_tph = st.number_input("Capacidad nominal (t/h)", min_value=0.1, value=12.0, step=0.5)
+    horas_dia = st.number_input("Horas operación/día", min_value=1.0, value=16.0, step=1.0)
+    dias_anio = st.number_input("Días operación/año", min_value=1.0, value=300.0, step=5.0)
+    cap_per_plant = float(cap_tph * horas_dia * dias_anio)
+    st.info(f"Capacidad por planta ≈ **{cap_per_plant:,.0f} t/año**")
+
+    st.header("5) ¿Permitir demanda > capacidad?")
+    allow_unmet = st.toggle("Permitir RSU no servido (correr igual)", value=True)
+    penalty_unmet = st.number_input(
+        "Penalización por RSU no servido (peso)",
+        min_value=0.0, value=500.0, step=50.0,
+        help="Más alto = el modelo intentará servir más RSU aunque aumenten distancias."
+    )
+
+    run = st.button("🚀 Calcular distancias + Optimizar", type="primary", use_container_width=True)
+
+    st.header("6) Explorador (barrido k, α, γ)")
+    do_sweep = st.toggle("Activar modo barrido", value=False)
+    if do_sweep:
+        k_min = st.number_input("k mínimo", min_value=1, max_value=max(1, len(municipios)), value=1, step=1)
+        k_max = st.number_input("k máximo", min_value=1, max_value=max(1, len(municipios)), value=min(3, len(municipios)), step=1)
+        alpha_min = st.slider("α mínimo", 0.0, 1.0, 0.5, 0.05)
+        alpha_max = st.slider("α máximo", 0.0, 1.0, 0.9, 0.05)
+        alpha_step = st.selectbox("Paso α", options=[0.05, 0.1, 0.2], index=1)
+        gamma_min = st.slider("γ mínimo", 0.0, 3.0, 0.0, 0.1)
+        gamma_max = st.slider("γ máximo", 0.0, 3.0, 1.5, 0.1)
+        gamma_step = st.selectbox("Paso γ", options=[0.1, 0.25, 0.5], index=1)
+        run_sweep = st.button("🧭 Correr barrido", use_container_width=True)
+    else:
+        run_sweep = False
 
 # =========================
-# Run
+# Main run
 # =========================
-if run:
+def compute_coords(municipios):
+    coords = {}
+    failed = []
+    for m in municipios:
+        c = geocode_municipio(m)
+        if c is None:
+            failed.append(m)
+        else:
+            coords[m] = c
+    return coords, failed
+
+def ensure_inputs(municipios, df_rsu):
     if len(municipios) < 2:
         st.error("Selecciona al menos 2 municipios.")
         st.stop()
-
-    # RSU series
     w = df_rsu.set_index("municipio")["rsu_t_anio"].astype(float)
-
-    # Pre-check capacidad total
     if w.sum() <= 0:
-        st.error("La suma total de RSU debe ser > 0 (revisa la tabla de entradas).")
+        st.error("La suma total de RSU debe ser > 0 (t/año).")
         st.stop()
+    return w
 
-    if w.sum() > cap_t_anio * k:
-        st.error(
-            f"RSU total ({w.sum():,.0f} t/año) excede la capacidad total ({cap_t_anio*k:,.0f} t/año). "
-            "Aumenta k o la capacidad por planta (t/h u horas/año)."
-        )
-        st.stop()
+if run or run_sweep:
+    w = ensure_inputs(municipios, df_rsu)
 
-    # Geocode
     with st.spinner("Geocodificando municipios (OSM/Nominatim)..."):
-        coords = {}
-        failed = []
-        for m in municipios:
-            c = geocode_municipio(m)
-            if c is None:
-                failed.append(m)
-            else:
-                coords[m] = c
-
+        coords, failed = compute_coords(municipios)
     if failed:
-        st.error(
-            f"No pude geocodificar: {failed}. "
-            "Prueba a renombrar (ej. 'El Peñol' -> 'Peñol') o intenta de nuevo."
-        )
+        st.error(f"No pude geocodificar: {failed}. Prueba renombrar (ej. 'El Peñol' -> 'Peñol') o intenta de nuevo.")
         st.stop()
 
-    # Distances
     with st.spinner("Calculando matriz de distancias viales (OSRM, por carretera)..."):
         dfD = build_distance_matrix_osrm(coords)
 
     st.subheader("1) dfD – Matriz de distancias viales (km) todos vs todos")
     st.dataframe(dfD.style.format("{:.1f}"), use_container_width=True)
 
-    # Ranking single-plant (simple)
-    st.subheader("2) Ranking simple (k=1) por costo logístico ponderado (RSU·km)")
+    # Ranking k=1
+    st.subheader("2) Ranking de candidatos (k=1) por costo logístico ponderado")
     df_rank = candidate_ranking_single_plant(dfD, w)
     st.dataframe(df_rank, use_container_width=True)
 
-    # Solve k=1 baseline and chosen k (comparison)
-    st.subheader("3) Comparación: 1 planta vs k plantas")
-    try:
-        sol_1 = solve_facility_location_v2(dfD, w, k=1, alpha=alpha, gamma=gamma, cap_t_anio=cap_t_anio)
-        sol_k = solve_facility_location_v2(dfD, w, k=k, alpha=alpha, gamma=gamma, cap_t_anio=cap_t_anio)
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
+    # ---------- Barrido ----------
+    if run_sweep:
+        st.subheader("🧭 Mapa conceptual de decisiones (barrido k, α, γ)")
+        k_vals = list(range(int(k_min), int(k_max) + 1))
+        alpha_vals = np.round(np.arange(alpha_min, alpha_max + 1e-9, alpha_step), 3).tolist()
+        gamma_vals = np.round(np.arange(gamma_min, gamma_max + 1e-9, gamma_step), 3).tolist()
 
-    cA, cB = st.columns(2)
+        rows = []
+        with st.spinner("Corriendo barrido... (esto puede tardar un poco)"):
+            for kk in k_vals:
+                for aa in alpha_vals:
+                    for gg in gamma_vals:
+                        sol = solve_facility_location_v2(
+                            dfD=dfD, w=w, k=kk, alpha=float(aa), gamma=float(gg),
+                            cap_per_plant_t_anio=cap_per_plant,
+                            allow_unmet=allow_unmet,
+                            penalty_unmet=float(penalty_unmet),
+                        )
+                        rows.append({
+                            "k": kk,
+                            "alpha": float(aa),
+                            "gamma": float(gg),
+                            "status": sol["status"],
+                            "opened": ", ".join(sol["opened"]),
+                            "costo_logistico_tkm_anio": sol["total_cost_wdist"],
+                            "dist_prom_pond_km": sol["wavg_dist_km"],
+                            "dist_max_km": sol["max_dist_km"],
+                            "util_avg_%": sol["util_avg_%"],
+                            "util_min_%": sol["util_min_%"],
+                            "unmet_t_anio": sol["unmet_t_anio"],
+                        })
 
-    with cA:
-        st.markdown("### Caso A: **1 planta**")
-        st.write("**Planta(s):**", ", ".join(sol_1["opened"]) if sol_1["opened"] else "—")
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("WAvg dist (km)", f"{sol_1['wavg_dist_km']:.1f}")
-        m2.metric("Max dist (km)", f"{sol_1['max_dist_km']:.1f}")
-        m3.metric("Costo (t·km/año)", f"{sol_1['total_cost_wdist']:.0f}")
-        m4.metric("Max cap no usada (t/año)", f"{sol_1['u_max_unused_t_anio']:.0f}")
+        df_sweep = pd.DataFrame(rows)
+        st.dataframe(df_sweep, use_container_width=True)
 
-    with cB:
-        st.markdown(f"### Caso B: **k = {k} plantas**")
-        st.write("**Planta(s):**", ", ".join(sol_k["opened"]) if sol_k["opened"] else "—")
-        n1, n2, n3, n4 = st.columns(4)
-        n1.metric("WAvg dist (km)", f"{sol_k['wavg_dist_km']:.1f}")
-        n2.metric("Max dist (km)", f"{sol_k['max_dist_km']:.1f}")
-        n3.metric("Costo (t·km/año)", f"{sol_k['total_cost_wdist']:.0f}")
-        n4.metric("Max cap no usada (t/año)", f"{sol_k['u_max_unused_t_anio']:.0f}")
+        metric = st.selectbox(
+            "Métrica a visualizar",
+            options=[
+                "costo_logistico_tkm_anio",
+                "dist_prom_pond_km",
+                "dist_max_km",
+                "util_avg_%",
+                "util_min_%",
+                "unmet_t_anio",
+            ],
+            index=0
+        )
 
-    st.info("Tip: si al subir k baja mucho Max dist pero sube el costo, juega con α. Si la utilización cae, sube γ o revisa si k es demasiado alto para la demanda.")
+        gamma_slice = st.selectbox("Fijar γ (rebanada para mapa k vs α)", options=sorted(df_sweep["gamma"].unique()), index=0)
+        df_slice = df_sweep[df_sweep["gamma"] == gamma_slice].copy()
 
-    # Show solution details (k)
-    st.subheader("4) Solución detallada (k plantas)")
-    df_assign = sol_k["df_assign"].copy()
-    df_assign["%RSU"] = 100 * df_assign["rsu_t_anio"] / df_assign["rsu_t_anio"].sum()
-    st.dataframe(df_assign.sort_values("rsu_t_anio", ascending=False), use_container_width=True)
+        # Heatmap k vs alpha
+        pivot = df_slice.pivot_table(index="k", columns="alpha", values=metric, aggfunc="mean")
+        pivot = pivot.sort_index().sort_index(axis=1)
 
-    # Plant utilization table
-    st.subheader("5) Carga / utilización por planta (capacidad y uso)")
-    df_plants = sol_k["df_plants"].copy()
-    st.dataframe(df_plants.sort_values("utilizacion_%", ascending=True), use_container_width=True)
+        fig_hm = px.imshow(
+            pivot,
+            text_auto=".2f",
+            aspect="auto",
+            labels=dict(x="α", y="k", color=metric),
+            title=f"Mapa conceptual: k vs α (γ fijo = {gamma_slice}) — métrica: {metric}"
+        )
+        st.plotly_chart(fig_hm, use_container_width=True)
 
-    # Heuristic ratio (%RSU/km)
-    st.subheader("6) %RSU / Distancia_a_Planta (heurística de priorización)")
-    eps = 1e-6
-    df_ratio = df_assign.copy()
-    df_ratio["ratio_%RSU_por_km"] = (df_ratio["%RSU"] / (df_ratio["dist_km"] + eps))
-    df_ratio = df_ratio.sort_values("ratio_%RSU_por_km", ascending=False)
-    st.dataframe(df_ratio[["municipio","planta_asignada","dist_km","%RSU","ratio_%RSU_por_km"]], use_container_width=True)
+        st.info("Tip: usa el mapa para ver regiones de decisión: centralización (k bajo, γ alto) vs distribución (k alto, α bajo).")
 
-    # Radial cluster plot (replace bar charts)
-    st.subheader("7) Visual: clúster circular (radial) por planta asignada")
-    fig_radial = radial_cluster_plot(df_assign, sol_k["opened"])
-    if fig_radial is not None:
-        st.plotly_chart(fig_radial, use_container_width=True)
-    else:
-        st.warning("No fue posible construir el gráfico radial con la solución actual.")
+    # ---------- Corrida puntual ----------
+    if run:
+        st.subheader("3) Solución optimizada (corrida puntual)")
+
+        sol = solve_facility_location_v2(
+            dfD=dfD, w=w, k=k, alpha=alpha, gamma=gamma,
+            cap_per_plant_t_anio=cap_per_plant,
+            allow_unmet=allow_unmet,
+            penalty_unmet=float(penalty_unmet),
+        )
+
+        # KPIs
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Estado solver", sol["status"])
+        c2.metric("Costo logístico (t·km/año)", f"{sol['total_cost_wdist']:.0f}")
+        c3.metric("Distancia prom. ponderada (km)", f"{sol['wavg_dist_km']:.1f}" if sol["wavg_dist_km"] == sol["wavg_dist_km"] else "—")
+        c4.metric("Distancia máxima (km)", f"{sol['max_dist_km']:.1f}" if sol["max_dist_km"] == sol["max_dist_km"] else "—")
+        c5.metric("RSU no servido (t/año)", f"{sol['unmet_t_anio']:.0f}")
+
+        st.write("**Plantas seleccionadas:**", ", ".join(sol["opened"]) if sol["opened"] else "—")
+
+        # Nota de capacidad
+        demand = sol["demand_total_t_anio"]
+        served = sol["served_total_t_anio"]
+        cap_total = cap_per_plant * int(k)
+        if demand > cap_total and allow_unmet:
+            st.warning(
+                f"Demanda total RSU (**{demand:,.0f} t/año**) excede capacidad total (**{cap_total:,.0f} t/año**). "
+                f"Se optimizó sirviendo **{served:,.0f} t/año** y dejando **{(demand-served):,.0f} t/año** sin atender. "
+                f"Sugerencia: aumenta **k** o la **capacidad por planta**."
+            )
+
+        # Asignaciones
+        df_assign = sol["df_assign"].copy()
+        df_assign["%RSU"] = 100 * df_assign["rsu_t_anio"] / max(1e-9, df_assign["rsu_t_anio"].sum())
+        df_assign["%Servido"] = 100 * df_assign["served_t_anio"] / max(1e-9, df_assign["served_t_anio"].sum()) if df_assign["served_t_anio"].sum() > 0 else 0.0
+
+        st.subheader("4) Asignación municipios → planta (con RSU servida)")
+        st.dataframe(df_assign.sort_values("rsu_t_anio", ascending=False), use_container_width=True)
+
+        st.subheader("5) Carga / utilización por planta")
+        st.dataframe(sol["df_plants"], use_container_width=True)
+
+        # Heurística %RSU/dist
+        st.subheader("6) %RSU / Distancia_a_Planta (heurística)")
+        eps = 1e-6
+        df_ratio = df_assign.copy()
+        df_ratio["ratio_%RSU_por_km"] = (df_ratio["%RSU"] / (df_ratio["dist_km"] + eps))
+        df_ratio = df_ratio.sort_values("ratio_%RSU_por_km", ascending=False)
+        st.dataframe(df_ratio[["municipio","planta_asignada","dist_km","%RSU","ratio_%RSU_por_km"]], use_container_width=True)
+
+        # Visualización circular (approx) usando dist_km como radio y plantas como centros
+        st.subheader("7) Visual tipo ‘radio de acción’ (aprox. por distancias asignadas)")
+        # Para un primer V2: usamos un scatter con “planta_asignada” como color y dist_km como eje radial (simple y útil)
+        fig_sc = px.scatter(
+            df_assign,
+            x="dist_km",
+            y="served_t_anio",
+            color="planta_asignada",
+            hover_data=["municipio", "rsu_t_anio", "served_t_anio"],
+            title="Municipios (distancia a planta) vs RSU servida — color = planta asignada"
+        )
+        st.plotly_chart(fig_sc, use_container_width=True)
+
+        st.info("Siguiente mejora natural: convertir esto en un diagrama circular por planta (polos) con anillos de distancia (10, 20, 30 km).")
 
 else:
-    st.warning("Configura municipios + RSU (preset editable) + capacidad + (α, γ, k) y presiona **Calcular distancias + Optimizar (V2)**.")
+    st.warning("Configura municipios + RSU (preset editable) y presiona **Calcular distancias + Optimizar**.")
